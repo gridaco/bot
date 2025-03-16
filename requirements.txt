@@ -1,0 +1,4 @@
+click
+pathspec
+ollama
+tqdm
