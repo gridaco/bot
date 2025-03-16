@@ -2,6 +2,17 @@
 
 Grida bot running locally doing chors with LLM
 
+## Setup
+
+```bash
+# install uv (https://github.com/astral-sh/uv?tab=readme-ov-file#installation)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+uv venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+```
+
 ## Tasks
 
 ### Code Analyzer
