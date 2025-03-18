@@ -3,13 +3,26 @@ from pathlib import Path
 import pathspec
 import click
 import ollama
-from tqdm import tqdm
-
+from rich.console import Console
+from rich.live import Live
+from rich.progress import (
+    Progress, SpinnerColumn, BarColumn, TextColumn,
+    TaskProgressColumn, TimeRemainingColumn, TimeElapsedColumn, MofNCompleteColumn
+)
+from rich.logging import RichHandler
+from rich.layout import Layout
+from rich.panel import Panel
+from collections import deque
 
 model = "gemma3:27b"
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    handlers=[RichHandler(rich_tracebacks=True)]
+)
+
+logger = logging.getLogger("rich")
 
 
 def load_ignore_patterns(repo_path: Path, *ignore_files):
@@ -37,14 +50,8 @@ def list_files(repo_path: Path, pattern: str):
     ]
 
 
-def analyze_file(file: Path, repo_path: Path):
-    try:
-        content = file.read_text(errors="ignore")
-    except Exception as e:
-        logging.error(f"Error reading {file}: {e}")
-        return None
-
-    prompt = f"""
+def mkprompt(root: Path, file: Path, content: str):
+    return f"""
 <system>
 You're a senior code reviewer. Carefully analyze the provided code and respond strictly according to the following format:
 
@@ -84,7 +91,7 @@ Avoid minor stylistic or trivial issues. If the code meets good standards and no
 </system>
 
 <file>
-{file.relative_to(repo_path)}
+{file.relative_to(root)}
 <file>
 
 <user-code>
@@ -93,25 +100,54 @@ Avoid minor stylistic or trivial issues. If the code meets good standards and no
 ```
 </user-code>
 """
+
+
+def analyze_file(file: Path, repo_path: Path):
     try:
-        # Synchronous generation without streaming
-        result = ollama.generate(model, prompt=prompt, stream=False)
-        response_text = result.get("response", "")
+        content = file.read_text(errors="ignore")
     except Exception as e:
-        logging.error(f"Error analyzing {file}: {e}")
-        return None
+        logger.error(f"Error reading {file}: {e}")
+        return
+
+    prompt = mkprompt(repo_path, file, content)
 
     output_file = repo_path / "analysis" / file.relative_to(repo_path)
     output_file = output_file.with_suffix(output_file.suffix + ".md")
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        output_file.write_text(response_text)
-    except Exception as e:
-        logging.error(f"Error writing analysis for {file}: {e}")
-        return None
 
-    tqdm.write(f"\nFinished analysis for {file}\n")
-    return response_text
+    analysis = ""
+
+    try:
+        stream = ollama.generate(model=model, prompt=prompt, stream=True)
+        for chunk in stream:
+            part = chunk.get('response', '')
+            analysis += part
+            yield part
+    except Exception as e:
+        logger.error(f"Error analyzing {file}: {e}")
+        return
+
+    try:
+        output_file.write_text(analysis)
+    except Exception as e:
+        logger.error(f"Error writing analysis to {output_file}: {e}")
+        return
+
+
+def process_analysis(file: Path, repo_path: Path, stream_layout):
+    buffer = [""]
+    for token in analyze_file(file, repo_path):
+        if '\n' in token:
+            lines = token.split('\n')
+            buffer[-1] += lines[0]
+            buffer.extend(lines[1:])
+        else:
+            buffer[-1] += token
+
+        # update immediately, let Rich panel handle overflow visually
+        stream_layout.update(
+            Panel('\n'.join(buffer[-2:]), title=f"AI Streaming: {file.name}")
+        )
 
 
 @click.command()
@@ -121,15 +157,66 @@ Avoid minor stylistic or trivial issues. If the code meets good standards and no
 def main(directory, pattern, overwrite):
     repo_path = Path(directory)
     files = list_files(repo_path, pattern)
-    logging.info(
-        f"Found {len(files)} files with pattern '{pattern}' to process.")
-    for file in tqdm(files, desc="Processing files"):
-        output_file = repo_path / "analysis" / file.relative_to(repo_path)
-        output_file = output_file.with_suffix(output_file.suffix + ".md")
-        if output_file.exists() and not overwrite:
-            tqdm.write(f"Skipping {file} (analysis already exists)")
-            continue
-        analyze_file(file, repo_path)
+
+    console = Console()
+    log_buffer = deque(maxlen=100)
+
+    class LayoutLogHandler(logging.Handler):
+        def __init__(self, layout):
+            super().__init__()
+            self.layout = layout
+            self.setFormatter(logging.Formatter("%(message)s"))
+
+        def emit(self, record):
+            msg = self.format(record)
+            log_buffer.append(msg)
+            self.layout["log"].update(
+                Panel("\n".join(log_buffer), title="Logs"))
+
+    layout = Layout()
+    layout.split(
+        Layout(name="progress", size=3),
+        Layout(name="log", ratio=1),
+        Layout(name="stream", size=10)
+    )
+
+    progress = Progress(
+        SpinnerColumn(),
+        MofNCompleteColumn(),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
+    task = progress.add_task("[cyan]Analyzing files...", total=len(files))
+
+    layout["progress"].update(progress)
+    layout["log"].update(Panel("", title="Logs"))
+    layout["stream"].update(Panel("", title="AI Streaming Output"))
+
+    # Pass layout explicitly here:
+    logger.handlers = [LayoutLogHandler(layout)]
+    logger.setLevel(logging.INFO)
+
+    with Live(layout, refresh_per_second=10, console=console):
+        logger.info(
+            f"Found {len(files)} files with pattern '{pattern}' to process.")
+        for file in files:
+            output_file = repo_path / "analysis" / file.relative_to(repo_path)
+            output_file = output_file.with_suffix(output_file.suffix + ".md")
+            if output_file.exists() and not overwrite:
+                logger.info(
+                    f"⏭️ Skipping {file.relative_to(repo_path)} (analysis exists)")
+                progress.advance(task)
+                continue
+
+            process_analysis(file, repo_path, layout["stream"])
+            logger.info(
+                f"✅ Completed analysis for {file.relative_to(repo_path)}")
+            progress.advance(task)
+
+    logger.info("[green bold]All files processed successfully![/green bold]")
 
 
 if __name__ == "__main__":
