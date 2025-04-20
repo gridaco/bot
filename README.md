@@ -1,6 +1,6 @@
 # bot
 
-Grida bot running locally doing chors with LLM
+Grida bot running locally doing chores with LLM
 
 ## Setup
 
